@@ -27,11 +27,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="SFX Generator", lifespan=lifespan)
+app = FastAPI(title="Sound + BGM Generator", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8600", "http://localhost:8600"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

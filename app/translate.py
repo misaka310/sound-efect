@@ -8,8 +8,8 @@ from app.config import settings
 JAPANESE_RE = re.compile(r"[ぁ-ヿ㐀-䶿一-鿿]")
 
 SYSTEM_PROMPT = (
-    "You are a translator for a sound-effect generation AI. Translate the Japanese "
-    "description of a sound effect into a concise English prompt suitable for a "
+    "You are a translator for a sound-effect or instrumental music generation AI. Translate the Japanese "
+    "description into a concise English prompt suitable for a text-to-audio model. "
     "text-to-audio model. Output ONLY the English prompt, nothing else."
 )
 
@@ -39,6 +39,6 @@ async def check_translator_ok() -> bool:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(f"{settings.llm_url}/models")
-            return resp.status_code < 500
+            return 200 <= resp.status_code < 300
     except Exception:
         return False
