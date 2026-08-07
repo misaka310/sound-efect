@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sounds (
   prompt_original TEXT NOT NULL,
   prompt_en TEXT NOT NULL,
   source TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'sfx',
   duration_s REAL NOT NULL,
   sample_rate INTEGER NOT NULL,
   filename TEXT NOT NULL,
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS sounds (
 # name -> column definition, added via ALTER TABLE if missing (schema migration for
 # generation-parameter fields added after the initial release).
 _EXTRA_COLUMNS = {
+    "mode": "TEXT NOT NULL DEFAULT 'sfx'",
     "seed": "INTEGER",
     "steps": "INTEGER",
     "cfg_scale": "REAL",
@@ -56,6 +58,19 @@ def init_db():
             for col, col_type in _EXTRA_COLUMNS.items():
                 if col not in existing:
                     conn.execute(f"ALTER TABLE sounds ADD COLUMN {col} {col_type}")
+            # Existing databases may predate the constraint. Normalize any old
+            # duplicates first, then let SQLite protect names across processes.
+            rows = conn.execute("SELECT id, name FROM sounds ORDER BY created_at, id").fetchall()
+            seen = set()
+            for row in rows:
+                candidate, suffix = row["name"], 2
+                while candidate in seen:
+                    candidate = f"{row['name']}_{suffix}"
+                    suffix += 1
+                if candidate != row["name"]:
+                    conn.execute("UPDATE sounds SET name = ? WHERE id = ?", (candidate, row["id"]))
+                seen.add(candidate)
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS sounds_name_unique ON sounds(name)")
             conn.commit()
         finally:
             conn.close()
@@ -80,6 +95,7 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         "prompt_original": row["prompt_original"],
         "prompt_en": row["prompt_en"],
         "source": row["source"],
+        "mode": row["mode"],
         "duration_s": row["duration_s"],
         "sample_rate": row["sample_rate"],
         "url": f"/api/sounds/{row['id']}/audio",
@@ -119,12 +135,11 @@ def _unique_exact_name(conn: sqlite3.Connection, name: str, exclude_id: Optional
 
 
 def _next_auto_name(conn: sqlite3.Connection, base: str) -> str:
-    """base + '_' + 3-digit sequence, sequence = existing count with this base + 1."""
-    count = conn.execute(
-        "SELECT COUNT(*) FROM sounds WHERE name LIKE ? ESCAPE '\\'",
-        (base.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%") + "\\_%",),
-    ).fetchone()[0]
-    seq = count + 1
+    """Find max suffix, not row count, so deletion never reuses a name."""
+    # Include explicit names matching the pattern and choose the highest suffix.
+    all_names = [r[0] for r in conn.execute("SELECT name FROM sounds WHERE name LIKE ? ESCAPE '\\'", (base.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%") + "\\_%",))]
+    suffixes = [int(m.group(1)) for name in all_names if (m := re.fullmatch(re.escape(base) + r"_(\d+)", name))]
+    seq = max(suffixes, default=0) + 1
     return f"{base}_{seq:03d}"
 
 
@@ -133,6 +148,7 @@ def create_sound(
     prompt_original: str,
     prompt_en: str,
     source: str,
+    mode: str = "sfx",
     duration_s: float,
     sample_rate: int,
     audio: np.ndarray,
@@ -160,10 +176,10 @@ def create_sound(
 
             created_at = datetime.now(timezone.utc).isoformat()
             conn.execute(
-                "INSERT INTO sounds (id, name, prompt_original, prompt_en, source, "
+                "INSERT INTO sounds (id, name, prompt_original, prompt_en, source, mode, "
                 "duration_s, sample_rate, filename, created_at, seed, steps, cfg_scale, "
-                "negative_prompt) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (sound_id, final_name, prompt_original, prompt_en, source,
+                "negative_prompt) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sound_id, final_name, prompt_original, prompt_en, source, mode,
                  round(duration_s, 3), sample_rate, filename, created_at,
                  seed, steps, cfg_scale, negative_prompt),
             )

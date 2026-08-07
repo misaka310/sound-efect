@@ -1,0 +1,9 @@
+[project]
+name = "sound-efect"
+version = "0.2.0"
+requires-python = ">=3.10,<3.14"
+dependencies = ["stable-audio-3 @ git+https://github.com/Stability-AI/stable-audio-3.git", "fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.28", "soundfile>=0.12", "numpy>=1.26", "python-multipart>=0.0.9"]
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.8"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

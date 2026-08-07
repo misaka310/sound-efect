@@ -1,13 +1,11 @@
-# Reference only — venv is already built; no install needed to run the app.
-# torch install is hardware-specific (CUDA build here); see https://pytorch.org/get-started/locally/
-torch==2.7.1+cu128
-torchaudio==2.7.1+cu128
-stable-audio-3==0.1.0
-fastapi==0.139.0
-uvicorn==0.51.0
-httpx==0.28.1
-soundfile==0.14.0
-numpy==2.5.1
-pydantic==2.13.4
-anyio==4.14.1
-python-multipart==0.0.32
+# PyTorch is installed separately by setup.bat to select CUDA or CPU.
+git+https://github.com/Stability-AI/stable-audio-3.git
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.28
+soundfile>=0.12
+numpy>=1.26
+python-multipart>=0.0.9
+pytest>=8
+pytest-asyncio>=0.23
+ruff>=0.8

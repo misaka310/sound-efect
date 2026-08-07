@@ -1,4 +1,5 @@
-"""/api/* endpoints."""
+"""HTTP API. `mode` is optional for backward compatible SFX requests."""
+
 from typing import Optional
 from urllib.parse import quote
 
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/api")
 
 
 class GenerateRequest(BaseModel):
+    mode: str = "sfx"
     prompt: Optional[str] = None
     preset_id: Optional[str] = None
     duration: Optional[float] = None
@@ -42,12 +44,15 @@ class GainRequest(BaseModel):
 
 @router.get("/status")
 async def get_status():
-    translator_ok = await translate.check_translator_ok()
+    state = sfx_model.status()
     return {
-        "model_loaded": sfx_model.loaded,
-        "model_loading": sfx_model.loading,
-        "model_error": sfx_model.error,
-        "translator_ok": translator_ok,
+        "model_loaded": state["loaded"],
+        "model_loading": state["loading"],
+        "model_error": state["error"],
+        "models": state["models"],
+        "active_mode": state["active_mode"],
+        "translator_ok": await translate.check_translator_ok(),
+        "translator_url": settings.llm_url,
         "device": settings.device,
     }
 
@@ -59,78 +64,82 @@ async def get_presets():
 
 @router.post("/generate")
 async def generate_sound(body: GenerateRequest):
+    mode = body.mode.lower()
+    if mode not in settings.model_names:
+        raise HTTPException(422, "mode must be 'sfx' or 'music'")
     if not body.prompt and not body.preset_id:
         raise HTTPException(400, "prompt or preset_id is required")
-
     preset = PRESETS_BY_ID.get(body.preset_id) if body.preset_id else None
     if body.preset_id and preset is None and not body.prompt:
         raise HTTPException(400, f"unknown preset_id: {body.preset_id}")
-
-    if body.prompt:
-        prompt_original = body.prompt
-        source = "custom"
-        duration = body.duration if body.duration is not None else 5.0
-        preset_label = None
-    else:
-        prompt_original = preset["prompt"]
-        source = preset["id"]
-        duration = body.duration if body.duration is not None else preset.get("duration", 5.0)
-        preset_label = preset["label"]
-
-    if not (0.5 <= duration <= 120):
-        raise HTTPException(422, "duration must be between 0.5 and 120")
-    if body.steps is not None and not (1 <= body.steps <= 100):
+    prompt_original = body.prompt if body.prompt else preset["prompt"]
+    source = "custom" if body.prompt else preset["id"]
+    duration = (
+        body.duration
+        if body.duration is not None
+        else (preset.get("duration") if preset else settings.default_durations[mode])
+    )
+    if duration is None:
+        duration = settings.default_durations[mode]
+    max_duration = 30 if mode == "sfx" else 120
+    if not 0.5 <= duration <= max_duration:
+        raise HTTPException(
+            422, f"duration must be between 0.5 and {max_duration} for {mode}"
+        )
+    if body.steps is not None and not 1 <= body.steps <= 100:
         raise HTTPException(422, "steps must be between 1 and 100")
-    if body.cfg_scale is not None and not (0.1 <= body.cfg_scale <= 10):
+    if body.cfg_scale is not None and not 0.1 <= body.cfg_scale <= 10:
         raise HTTPException(422, "cfg_scale must be between 0.1 and 10")
 
-    async def _translate(text: str) -> str:
-        if translate.needs_translation(text):
-            try:
-                return await translate.translate_to_english(text)
-            except Exception:
-                raise HTTPException(503, "翻訳サーバに接続できません。ローカルLLMの起動状態を確認してください。")
-        return text
+    async def english(text: str) -> str:
+        if not translate.needs_translation(text):
+            return text
+        try:
+            return await translate.translate_to_english(text)
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "日本語翻訳サーバーに接続できません。英語で入力するか、"
+                f"OpenAI互換サーバーを {settings.llm_url} に起動してください。詳細: {type(exc).__name__}",
+            )
 
-    prompt_en = await _translate(prompt_original)
-    negative_prompt_en = await _translate(body.negative_prompt) if body.negative_prompt else None
-
-    if not sfx_model.loaded:
-        detail = "モデルが読み込まれていません"
-        if sfx_model.error:
-            detail += f": {sfx_model.error}"
-        raise HTTPException(503, detail)
-
-    def _run():
-        return sfx_model.generate(
-            prompt_en,
-            duration,
-            seed=body.seed,
-            steps=body.steps,
-            cfg_scale=body.cfg_scale,
-            negative_prompt=negative_prompt_en,
-        )
-
+    prompt_en = await english(prompt_original)
+    negative_prompt_en = (
+        await english(body.negative_prompt) if body.negative_prompt else None
+    )
     try:
-        audio, sample_rate, seed_used = await anyio.to_thread.run_sync(_run)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-
-    sound = store.create_sound(
+        audio, sample_rate, seed_used = await anyio.to_thread.run_sync(
+            lambda: sfx_model.generate(
+                mode,
+                prompt_en,
+                duration,
+                seed=body.seed,
+                steps=body.steps,
+                cfg_scale=body.cfg_scale,
+                negative_prompt=negative_prompt_en,
+            )
+        )
+    except RuntimeError:
+        raise HTTPException(
+            503,
+            "モデルを読み込めませんでした。Hugging Faceでモデルのライセンスを承認し、"
+            "`huggingface-cli login` を実行後、GPU/空きメモリを確認して再試行してください。",
+        )
+    return store.create_sound(
         prompt_original=prompt_original,
         prompt_en=prompt_en,
         source=source,
+        mode=mode,
         duration_s=audio.shape[0] / sample_rate,
         sample_rate=sample_rate,
         audio=audio,
         name=body.name,
-        preset_label=preset_label,
+        preset_label=preset["label"] if preset else None,
         seed=seed_used,
-        steps=body.steps if body.steps is not None else 8,
-        cfg_scale=body.cfg_scale if body.cfg_scale is not None else 1.0,
+        steps=body.steps or 8,
+        cfg_scale=body.cfg_scale or 1.0,
         negative_prompt=negative_prompt_en,
     )
-    return sound
 
 
 @router.get("/sounds")
@@ -141,7 +150,7 @@ async def list_sounds():
 @router.get("/sounds/{sound_id}")
 async def get_sound(sound_id: str):
     sound = store.get_sound(sound_id)
-    if sound is None:
+    if not sound:
         raise HTTPException(404, "sound not found")
     return sound
 
@@ -149,30 +158,31 @@ async def get_sound(sound_id: str):
 @router.get("/sounds/{sound_id}/audio")
 async def get_audio(sound_id: str, download: int = Query(0)):
     sound = store.get_sound(sound_id)
-    if sound is None:
-        raise HTTPException(404, "sound not found")
-    path = store.wav_path(sound_id)
-    if not path.exists():
+    if not sound or not store.wav_path(sound_id).exists():
         raise HTTPException(404, "audio file not found")
-    headers = None
-    if download:
-        quoted = quote(f"{sound['name']}.wav")
-        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"}
-    return FileResponse(path, media_type="audio/wav", headers=headers)
+    headers = (
+        {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(sound['name'] + '.wav')}"
+        }
+        if download
+        else None
+    )
+    return FileResponse(
+        store.wav_path(sound_id), media_type="audio/wav", headers=headers
+    )
 
 
 @router.patch("/sounds/{sound_id}")
 async def rename_sound(sound_id: str, body: RenameRequest):
     sound = store.rename_sound(sound_id, body.name)
-    if sound is None:
+    if not sound:
         raise HTTPException(404, "sound not found")
     return sound
 
 
 @router.delete("/sounds/{sound_id}", status_code=204)
 async def delete_sound(sound_id: str):
-    ok = store.delete_sound(sound_id)
-    if not ok:
+    if not store.delete_sound(sound_id):
         raise HTTPException(404, "sound not found")
 
 
@@ -180,25 +190,20 @@ async def delete_sound(sound_id: str):
 async def cut_sound(sound_id: str, body: CutRequest):
     try:
         sound = store.cut_sound(sound_id, body.start_s, body.end_s)
-    except store.CutError as e:
-        raise HTTPException(400, str(e))
-    if sound is None:
+    except store.CutError as exc:
+        raise HTTPException(400, str(exc))
+    if not sound:
         raise HTTPException(404, "sound not found")
     return sound
 
 
 @router.post("/sounds/{sound_id}/gain")
 async def gain_sound(sound_id: str, body: GainRequest):
-    if not body.normalize:
-        if body.gain_db is None:
-            raise HTTPException(400, "gain_db or normalize is required")
-        if not (-24 <= body.gain_db <= 24):
-            raise HTTPException(422, "gain_db must be between -24 and 24")
     try:
-        sound = store.gain_sound(sound_id, gain_db=body.gain_db, normalize=body.normalize)
-    except store.GainError as e:
-        raise HTTPException(400, str(e))
-    if sound is None:
+        sound = store.gain_sound(sound_id, body.gain_db, body.normalize)
+    except store.GainError as exc:
+        raise HTTPException(400, str(exc))
+    if not sound:
         raise HTTPException(404, "sound not found")
     return sound
 
@@ -209,6 +214,6 @@ async def undo_sound(sound_id: str):
         sound = store.undo_sound(sound_id)
     except FileNotFoundError:
         raise HTTPException(404, "no backup available")
-    if sound is None:
+    if not sound:
         raise HTTPException(404, "sound not found")
     return sound
